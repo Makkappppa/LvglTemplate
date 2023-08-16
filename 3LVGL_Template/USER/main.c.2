@@ -1,0 +1,284 @@
+#include "stm32f4xx.h"
+#include "FreeRTOS.h"
+
+#include "led.h"
+#include "key.h"
+#include "usart.h"
+
+#include "queue.h"
+#include "semphr.h"
+#include "event_groups.h"
+#include "list.h"
+#include "task.h"
+#include "timers.h"
+
+#include "stdio.h"
+#include "string.h"
+/********************************\
+ *			宏定义				*
+\********************************/
+#define configTIMER_TASK_STACK_SIZE 128
+#define QUEUE_LENGTH 	4
+#define ITEM_SIZE 		sizeof( uint32_t )
+#define EVENT(x) 		(1 << (x))
+
+/********************************\
+ *			全局变量			*
+\********************************/
+// 任务堆栈
+
+static StackType_t IdleStack[configMINIMAL_STACK_SIZE];// 空闲任务
+static StackType_t TimerStack[configTIMER_TASK_STACK_SIZE];// 定时器任务
+
+// 任务控制块
+static StaticTask_t IdleTaskTCB;	// 空闲任务
+static StaticTask_t TimerTaskTCB;	// 定时器任务
+
+// 任务句柄
+static TaskHandle_t TaskCreatHandler 		= NULL;	//
+static TaskHandle_t Print_Task_Handle		= NULL;	//
+
+static TaskHandle_t LPriority_Task_Handle  	= NULL;	//
+static TaskHandle_t MPriority_Task_Handle  	= NULL;	//
+static TaskHandle_t HPriority_Task_Handle	= NULL;	//
+
+
+// 串口缓存区
+extern uint8_t Recv[50];
+extern uint16_t rxCnt;
+/********************************\
+ *			内核对象			*
+\********************************/
+extern SemaphoreHandle_t uartSemaphore;			// 串口状态信号量
+QueueHandle_t		QueueHandle;				// 消息队列句柄
+SemaphoreHandle_t	SemaphoreHandle;			// 信号量句柄
+SemaphoreHandle_t   BinarySem_Handle = NULL;	// 二值信号量
+EventGroupHandle_t  EventGroupHandle = NULL;	// 事件句柄
+
+TimerHandle_t		TMR1_Handler 	 = NULL;	//
+TimerHandle_t		TMR2_Handler 	 = NULL;	//
+
+
+/********************************\
+|*			函数声明			*|
+\********************************/
+
+static void taskCreate(void);
+static void Print_Task_Entry(void *parg);
+static void LPriority_Task_Entry(void *parg);
+static void MPriority_Task_Entry(void *parg);
+static void HPriority_Task_Entry(void *parg);
+
+void vApplicationGetIdleTaskMemory( StaticTask_t  **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize );
+void vApplicationGetTimerTaskMemory( StaticTask_t **ppxTimerTaskTCBBuffer, StackType_t **ppxTimerTaskStackBuffer, uint32_t *pulTimerTaskStackSize );
+void hardWareInit(void);
+
+
+
+/********************************\
+|*			main				*|
+\********************************/
+int main(){
+	BaseType_t xReturn = pdPASS;
+	hardWareInit();
+	xReturn = xTaskCreate(	(TaskFunction_t	)taskCreate,			
+							(const char* 	)"AppTaskCreate",			
+							(uint32_t 		)128,		
+							(void* 		  	)NULL,			
+							(UBaseType_t 	)1, 				
+							(TaskHandle_t*  )&TaskCreatHandler);		
+	if(NULL != xReturn)
+	vTaskStartScheduler();
+	for(;;){}
+		
+}
+
+
+static void taskCreate(void)
+{
+	BaseType_t xReturn = pdPASS;
+	taskENTER_CRITICAL();
+
+	// 任务Low
+	xReturn = xTaskCreate(	LPriority_Task_Entry, 
+							"LPriority_Task", 
+							128, 
+							(void *)NULL, 
+							2,
+							&LPriority_Task_Handle);
+	if ( xReturn == NULL)
+		printf("LPriority_Task create failed!\r\n");
+	else
+		printf("LPriority_Task create successfully!\r\n");	
+	// 任务Mid
+	xReturn = xTaskCreate(	MPriority_Task_Entry, 
+							"MPriority_Task", 
+							128, 
+							(void *)NULL, 
+							3,
+							&MPriority_Task_Handle);
+	if ( xReturn == NULL)
+		printf("MPriority_Task create failed!\r\n");
+	else
+		printf("MPriority_Task create successfully!\r\n");	
+	// 任务High
+	xReturn = xTaskCreate(	HPriority_Task_Entry, 
+							"HPriority_Task", 
+							128, 
+							(void *)NULL, 
+							4,
+							&HPriority_Task_Handle);
+	if ( xReturn == NULL)
+		printf("HPriority_Task create failed!\r\n");
+	else
+		printf("HPriority_Task create successfully!\r\n");	
+
+
+	// 任务:PrintTask
+	xReturn = xTaskCreate(	Print_Task_Entry, 
+							"Print_Task", 
+							256, 
+							(void *)NULL, 
+							4,
+							&Print_Task_Handle);
+		if ( xReturn == NULL)	printf("Print_Task create failed!");
+		else					printf("Print_Task create successfully!\r\n Buffer Size: %d\r\n", USART_RECEIVE_BUFFER_SIZE);
+
+	vTaskDelete(TaskCreatHandler);
+
+	taskEXIT_CRITICAL();
+	while(1);
+}
+/*  
+	// extern uint8_t Recv[50];
+	// extern uint8_t rxCnt;
+*/
+static void Print_Task_Entry(void *parg){
+	BaseType_t xReturn = pdFALSE;
+#if USART_USE_DMA_R
+	for (;;) {
+		xReturn = xSemaphoreTake(uartSemaphore, portMAX_DELAY);
+		if(xReturn == pdTRUE){
+			printf("\r\n  receive: %s\r\n", Recv);
+			
+			if (Recv[0] == 43 && Recv[1] == 49){
+				xTaskNotify(LPriority_Task_Handle, 1, eSetBits);
+			}else if (Recv[0] == 43 && Recv[1] == 50){
+				xTaskNotify(LPriority_Task_Handle, 2, eSetBits);
+			}
+			memset(Recv,0,USART_RECEIVE_BUFFER_SIZE);
+		}
+#else
+	uint16_t cnt = USART_RECEIVE_BUFFER_SIZE;
+	uint8_t buf[USART_RECEIVE_BUFFER_SIZE];
+	memset(buf,0,cnt);
+
+	for (;;) {
+		
+		if(xReturn == pdTRUE){
+			cnt = rxCnt <= USART_RECEIVE_BUFFER_SIZE ? rxCnt : USART_RECEIVE_BUFFER_SIZE;	// 判断是否超长
+			memcpy(buf, Recv, cnt);
+			buf[cnt] = 0;
+			rxCnt = 0;
+		}
+		if(cnt > 0){
+			printf("\r\n length:%d \r\n receive: %s\r\n", cnt, buf);
+			
+			if (buf[0] == 43 && buf[1] == 49){
+				xTaskNotify(LPriority_Task_Handle, 1, eSetBits);
+			}else if (buf[0] == 43 && buf[1] == 50){
+				xTaskNotify(LPriority_Task_Handle, 2, eSetBits);
+			}
+			cnt = 0;
+
+		}
+#endif
+		vTaskDelay(20);
+	}
+}
+
+static void LPriority_Task_Entry(void *parg){
+	BaseType_t 	xReturn = pdTRUE;
+	uint32_t notifyValue = 0;
+	static uint32_t i = 1;
+	
+	printf("LPriority_Task started\r\n");
+	for(;;){
+		notifyValue = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (notifyValue & 1){
+			xReturn = xTaskNotify(MPriority_Task_Handle, i, eSetValueWithOverwrite);
+			if (xReturn == pdPASS)
+				printf("Notify Task ''MPriority_Task''\r\n");
+		}
+		if (notifyValue & 2){
+			xReturn = xTaskNotify(HPriority_Task_Handle, NULL, eIncrement);
+			if (xReturn == pdPASS)
+				printf("Notify Task ''HPriority_Task''\r\n");
+		}
+		vTaskDelay(20);
+	}
+}
+static void MPriority_Task_Entry(void *parg){
+	uint32_t ulReturn = 0;
+	for(;;){
+		ulReturn = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		printf("'MPriority_Task'' Receive Notification: %d \r\n", ulReturn);
+		/**/
+		LED1_TOGGLE;
+		vTaskDelay(50);
+	}
+}
+
+static void HPriority_Task_Entry(void *parg){
+	uint32_t ulReturn = 0;
+	for(;;){
+		ulReturn = ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+		printf("''HPriority_Task'' Receive Notification: %d \r\n", ulReturn);
+		LED2_TOGGLE;
+		vTaskDelay(50);
+	}
+}
+
+
+void hardWareInit(void){
+	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+	ledInit();
+	KeyGPIOConfig();
+	LED1_ON;
+	LED2_ON;
+	//while(1);
+	USART_Config();
+	printf("config successfully\r\n");
+}
+
+void vApplicationGetIdleTaskMemory( 
+	StaticTask_t **ppxIdleTaskTCBBuffer, 
+	StackType_t **ppxIdleTaskStackBuffer, 
+	uint32_t *pulIdleTaskStackSize ) {
+	*ppxIdleTaskTCBBuffer = (StaticTask_t *)&IdleTaskTCB;
+	*ppxIdleTaskStackBuffer = IdleStack;
+	*pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+}
+void vApplicationGetTimerTaskMemory( 
+	StaticTask_t **ppxTimerTaskTCBBuffer, 
+	StackType_t **ppxTimerTaskStackBuffer, 
+	uint32_t *pulTimerTaskStackSize ){
+	*ppxTimerTaskTCBBuffer = (StaticTask_t *)&TimerTaskTCB;
+	*ppxTimerTaskStackBuffer = TimerStack;
+	*pulTimerTaskStackSize = configTIMER_TASK_STACK_SIZE;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

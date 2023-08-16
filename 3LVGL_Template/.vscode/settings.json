@@ -1,0 +1,24 @@
+{
+    "files.associations": {
+        "task.h": "c",
+        "led.h": "c",
+        "key.h": "c",
+        "list.h": "c",
+        "freertos.h": "c",
+        "stdio.h": "c",
+        "usart.h": "c",
+        "stm32f10x.h": "c",
+        "string": "c",
+        "array": "c",
+        "string_view": "c",
+        "initializer_list": "c",
+        "utility": "c",
+        "cstring": "c",
+        "stm32f4xx.h": "c",
+        "random": "c",
+        "dma.h": "c"
+    },
+    "cSpell.words": [
+        "USART"
+    ]
+}
